@@ -1,5 +1,12 @@
 @echo off
 setlocal
+
+where node >nul 2>nul
+if %ERRORLEVEL%==0 (
+    node "%~dp0opencode-unlimited" %*
+    exit /b %ERRORLEVEL%
+)
+
 set "SCRIPT=%~dp0opencode-unlimited.ps1"
 
 where pwsh >nul 2>nul

@@ -6,16 +6,35 @@ on:
   pull_request:
 
 jobs:
-  check:
+  check-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: syntax check
+        run: npm test
+
+      - name: cli smoke test
+        run: |
+          chmod +x bin/opencode-unlimited install.sh
+          ./bin/opencode-unlimited help
+          ./bin/opencode-unlimited version
+          ./bin/opencode-unlimited doctor
+          ./bin/opencode-unlimited identity show
+
+  check-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: node syntax
         shell: pwsh
-        run: |
-          node --check plugins/unlimited-shield.js
-          node --check lib/proxy-bridge.js
+        run: npm test
 
       - name: powershell syntax
         shell: pwsh
@@ -37,7 +56,7 @@ jobs:
         shell: pwsh
         run: |
           $bad = 0
-          Get-ChildItem -Recurse -File -Include *.ps1, *.js, *.cmd | ForEach-Object {
+          Get-ChildItem -Recurse -File -Include *.ps1, *.js, *.cmd, opencode-unlimited | ForEach-Object {
             $text = [System.IO.File]::ReadAllText($_.FullName)
             $count = ($text.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count
             if ($count -gt 0) {

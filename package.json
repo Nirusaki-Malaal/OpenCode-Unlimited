@@ -1,0 +1,27 @@
+{
+  "name": "opencode-unlimited",
+  "version": "1.0.2",
+  "description": "Fixes OpenCode's daily free-message limit from the command line: shows the real meter, clears the stale limit banner, rotates a local device id, and moves you onto a fresh network exit.",
+  "main": "bin/opencode-unlimited",
+  "bin": {
+    "opencode-unlimited": "./bin/opencode-unlimited"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "test": "node --check bin/opencode-unlimited && node --check plugins/unlimited-shield.js && node --check lib/proxy-bridge.js && node --check lib/oc-info.js && node --check lib/db-tools.js && node --check lib/session-reid.js && node --check lib/identity.js && node --check lib/egress.js && node --check lib/model-switch.js",
+    "doctor": "node bin/opencode-unlimited doctor"
+  },
+  "keywords": [
+    "opencode",
+    "ai",
+    "cli",
+    "rate-limit",
+    "proxy",
+    "unlimited"
+  ],
+  "author": "Nirusaki Malaal",
+  "license": "MIT"
+}

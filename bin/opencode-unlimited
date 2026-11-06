@@ -1,0 +1,1529 @@
+#!/usr/bin/env node
+
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const child_process = require("node:child_process");
+const { DatabaseSync } = require("node:sqlite");
+
+const ocInfo = require("../lib/oc-info.js");
+const dbTools = require("../lib/db-tools.js");
+const identity = require("../lib/identity.js");
+const egress = require("../lib/egress.js");
+const sessionReid = require("../lib/session-reid.js");
+const modelSwitch = require("../lib/model-switch.js");
+
+const TOOL_VERSION = "1.0.2";
+const DEFAULT_MODEL = "deepseek-v4.1-flash-free";
+const DEFAULT_BRIDGE_PORT = 8899;
+const GATEWAY = "https://opencode.ai/inference/openai/v1/chat/completions";
+const TRACE_URL = "https://cloudflare.com/cdn-cgi/trace";
+
+const scriptDir = __dirname;
+const rootDir = path.resolve(scriptDir, "..");
+const configDir = ocInfo.configDir();
+const dataDirs = ocInfo.dataDirs();
+const dataDir = dataDirs[dataDirs.length - 1] || path.join(os.homedir(), ".local", "share", "opencode");
+
+const stateFile = path.join(configDir, "unlimited.json");
+const infoFile = path.join(configDir, "unlimited-info.json");
+const pluginDir = path.join(configDir, "plugins");
+const pluginFile = path.join(pluginDir, "unlimited-shield.js");
+const pidFile = path.join(configDir, "unlimited-bridge.pid");
+const logFile = path.join(configDir, "unlimited-bridge.log");
+const ipCacheFile = path.join(configDir, "unlimited-ip.json");
+const bridgeJs = path.join(rootDir, "lib", "proxy-bridge.js");
+const bundledPlugin = path.join(rootDir, "plugins", "unlimited-shield.js");
+
+function step(text = "") {
+  console.log(text);
+}
+function ok(text) {
+  console.log(`  \x1b[32m[+]\x1b[0m ${text}`);
+}
+function warn(text) {
+  console.log(`  \x1b[33m[!]\x1b[0m ${text}`);
+}
+function bad(text) {
+  console.log(`  \x1b[31m[x]\x1b[0m ${text}`);
+}
+function info(text) {
+  console.log(`      \x1b[90m${text}\x1b[0m`);
+}
+
+function ensureDir(p) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+
+function readJson(file) {
+  if (!fs.existsSync(file)) return null;
+  try {
+    const raw = fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function writeJson(file, data) {
+  ensureDir(path.dirname(file));
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n", "utf8");
+}
+
+function getConfig() {
+  const cfg = {
+    pluginPath: pluginFile,
+    model: DEFAULT_MODEL,
+    orgId: "",
+    proxy: "",
+    proxyPool: [],
+    proxyIndex: 0,
+    bridgePort: DEFAULT_BRIDGE_PORT,
+    ipMode: "manual",
+    rotateDb: false,
+    lastIp: "",
+    lastBucket: "",
+    updatedAt: "",
+  };
+  const saved = readJson(stateFile);
+  if (saved && typeof saved === "object") {
+    Object.assign(cfg, saved);
+  }
+  return cfg;
+}
+
+function saveConfig(cfg) {
+  cfg.updatedAt = new Date().toISOString();
+  writeJson(stateFile, cfg);
+}
+
+function getCurl() {
+  try {
+    const exe = process.platform === "win32" ? "curl.exe" : "curl";
+    child_process.execFileSync(exe, ["--version"], { stdio: "ignore" });
+    return exe;
+  } catch {
+    return "";
+  }
+}
+
+async function getEgressIp(proxyUrl = "", force = false) {
+  const cache = readJson(ipCacheFile);
+  if (!force && cache && cache.ip && cache.ip !== "unavailable") {
+    const age = Math.floor(Date.now() / 1000) - Number(cache.at || 0);
+    if (age >= 0 && age < 60 && (cache.via || "") === (proxyUrl || "")) {
+      return cache.ip;
+    }
+  }
+
+  let ip = "unavailable";
+  const curl = getCurl();
+  if (curl) {
+    try {
+      const args = ["-s", "--max-time", "8"];
+      if (proxyUrl) args.push("--proxy", proxyUrl);
+      args.push(TRACE_URL);
+      const out = child_process.execFileSync(curl, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      for (const line of out.split("\n")) {
+        const m = line.match(/^ip=(.+)$/);
+        if (m) {
+          ip = m[1].trim();
+          break;
+        }
+      }
+    } catch {}
+  }
+
+  if (ip === "unavailable") {
+    try {
+      const res = await fetch(TRACE_URL, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) {
+        const text = await res.text();
+        for (const line of text.split("\n")) {
+          const m = line.match(/^ip=(.+)$/);
+          if (m) {
+            ip = m[1].trim();
+            break;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  if (ip !== "unavailable") {
+    writeJson(ipCacheFile, {
+      ip,
+      at: Math.floor(Date.now() / 1000),
+      via: proxyUrl || "",
+    });
+  }
+  return ip;
+}
+
+function getOpenCodeInfo(refresh = false) {
+  return ocInfo.info({ refresh });
+}
+
+function getDatabasePath() {
+  return ocInfo.findDatabase();
+}
+
+function getPluginState() {
+  if (fs.existsSync(pluginFile)) return "enabled";
+  if (fs.existsSync(pluginFile + ".disabled")) return "disabled";
+  return "missing";
+}
+
+function setPluginEnabled(enabled) {
+  const disabled = pluginFile + ".disabled";
+  if (enabled) {
+    if (fs.existsSync(disabled)) {
+      fs.renameSync(disabled, pluginFile);
+    }
+  } else {
+    if (fs.existsSync(pluginFile)) {
+      fs.renameSync(pluginFile, disabled);
+    }
+  }
+}
+
+function installPlugin() {
+  if (!fs.existsSync(bundledPlugin)) {
+    bad(`bundled plugin missing: ${bundledPlugin}`);
+    return;
+  }
+  ensureDir(pluginDir);
+  fs.copyFileSync(bundledPlugin, pluginFile);
+  const disabled = pluginFile + ".disabled";
+  if (fs.existsSync(disabled)) {
+    try { fs.unlinkSync(disabled); } catch {}
+  }
+  ok(`plugin deployed: ${pluginFile}`);
+}
+
+function setServiceEnv(name, value) {
+  const exe = ocInfo.findExe();
+  try {
+    if (!value) {
+      child_process.execFileSync(exe, ["service", "unset", "env", name], { stdio: "ignore" });
+    } else {
+      child_process.execFileSync(exe, ["service", "set", "env", name, value], { stdio: "ignore" });
+    }
+  } catch {}
+}
+
+function restartService() {
+  const exe = ocInfo.findExe();
+  info("restarting background service");
+  try {
+    child_process.execFileSync(exe, ["service", "restart"], { stdio: "ignore" });
+  } catch {
+    warn("service restart failed");
+  }
+}
+
+function getBridgePid() {
+  if (!fs.existsSync(pidFile)) return 0;
+  try {
+    const raw = fs.readFileSync(pidFile, "utf8").trim();
+    const pid = Number(raw);
+    if (!Number.isInteger(pid) || pid <= 0) return 0;
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    return 0;
+  }
+}
+
+function startBridge(cfg) {
+  const existing = getBridgePid();
+  if (existing > 0) {
+    info(`bridge already running (pid ${existing})`);
+    return true;
+  }
+  if (!fs.existsSync(bridgeJs)) {
+    bad(`bridge script missing: ${bridgeJs}`);
+    return false;
+  }
+
+  ensureDir(path.dirname(logFile));
+  const logFd = fs.openSync(logFile, "a");
+  const args = [bridgeJs, "--listen", `127.0.0.1:${cfg.bridgePort}`, "--upstream", cfg.proxy, "--log", logFile];
+
+  try {
+    const child = child_process.spawn(process.execPath, args, {
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+    });
+    fs.writeFileSync(pidFile, String(child.pid), "utf8");
+    child.unref();
+    fs.closeSync(logFd);
+
+    // Give it a moment to bind
+    const start = Date.now();
+    while (Date.now() - start < 800) {
+      // busy sleep
+    }
+
+    try {
+      process.kill(child.pid, 0);
+      ok(`bridge up on 127.0.0.1:${cfg.bridgePort} -> ${cfg.proxy}`);
+      return true;
+    } catch {
+      bad(`bridge exited, see ${logFile}`);
+      return false;
+    }
+  } catch (err) {
+    bad(`failed to start bridge: ${err.message}`);
+    return false;
+  }
+}
+
+function stopBridge() {
+  const pid = getBridgePid();
+  if (pid > 0) {
+    try {
+      process.kill(pid, "SIGTERM");
+      ok("bridge stopped");
+    } catch {}
+  }
+  if (fs.existsSync(pidFile)) {
+    try { fs.unlinkSync(pidFile); } catch {}
+  }
+}
+
+function testUpstream(proxyUrl) {
+  const curl = getCurl();
+  if (!curl) return true;
+  try {
+    const out = child_process.execFileSync(curl, ["-s", "--max-time", "10", "--proxy", proxyUrl, TRACE_URL], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return Boolean(out && out.includes("ip="));
+  } catch {
+    return false;
+  }
+}
+
+function applyProxy(cfg) {
+  if (!cfg.proxy) {
+    setServiceEnv("HTTPS_PROXY", "");
+    setServiceEnv("HTTP_PROXY", "");
+    setServiceEnv("ALL_PROXY", "");
+    setServiceEnv("NO_PROXY", "localhost,127.0.0.1");
+    ok("service proxy cleared, direct egress");
+    return true;
+  }
+
+  let url = cfg.proxy;
+  let viaBridge = false;
+  if (/^socks5h?:\/\//i.test(url)) {
+    if (!startBridge(cfg)) return false;
+    url = `http://127.0.0.1:${cfg.bridgePort}`;
+    viaBridge = true;
+  }
+
+  if (!testUpstream(url)) {
+    bad(`upstream not answering: ${cfg.proxy}`);
+    info("opencode was not switched, fix the proxy and retry");
+    if (viaBridge) stopBridge();
+    return false;
+  }
+
+  ok("upstream reachable");
+  setServiceEnv("HTTPS_PROXY", url);
+  setServiceEnv("HTTP_PROXY", url);
+  setServiceEnv("ALL_PROXY", url);
+  setServiceEnv("NO_PROXY", "localhost,127.0.0.1");
+  ok(`service proxy set: ${url}`);
+  return true;
+}
+
+async function invokeEgressRotation(cfg, avoidIp = "", dry = false) {
+  const pool = Array.isArray(cfg.proxyPool) ? cfg.proxyPool.filter((p) => /^(socks5h?|https?):\/\//i.test(p)) : [];
+  if (!pool.length) {
+    if (cfg.proxy) {
+      if (dry) {
+        info(`would apply: ${cfg.proxy}`);
+        return;
+      }
+      if (applyProxy(cfg)) restartService();
+      return;
+    }
+    info("manual mode, no proxy configured");
+    info("change the network yourself, or load a pool: opencode-unlimited proxy pool add socks5://host:port");
+    return;
+  }
+
+  if (dry) {
+    const next = pool[(Number(cfg.proxyIndex || 0) + 1) % pool.Count];
+    info(`would rotate to: ${next} (${pool.length} in the pool)`);
+    return;
+  }
+
+  const tries = Math.min(pool.length, 8);
+  for (let attempt = 0; attempt < tries; attempt++) {
+    cfg.proxyIndex = (Number(cfg.proxyIndex || 0) + 1) % pool.length;
+    const url = pool[cfg.proxyIndex];
+    info(`trying proxy ${cfg.proxyIndex + 1}/${pool.length}: ${url}`);
+    cfg.proxy = url;
+    cfg.ipMode = "proxy";
+    saveConfig(cfg);
+    if (!applyProxy(cfg)) continue;
+    restartService();
+    await new Promise((r) => setTimeout(r, 1000));
+    const ip = await getEgressIp(url, true);
+    if (!ip || ip === "unavailable") {
+      warn("egress ip unknown through this proxy, next");
+      continue;
+    }
+    if (avoidIp && ip === avoidIp) {
+      warn(`same egress ip: ${ip}, next`);
+      continue;
+    }
+    ok(`egress via ${url} -> ${ip}`);
+    return;
+  }
+  warn("no proxy in the pool produced a new egress ip");
+}
+
+function installSlashCommands() {
+  const cli = path.join(scriptDir, "opencode-unlimited");
+  const tail = "\n\nAnswer with one short line about what the output above reported. No more.";
+  const defs = {
+    "opencode-unlimited": { args: "status", desc: "OpenCode free-tier helper - identity, egress block, reset clock" },
+    "opencode-unlimited:reset": { args: "reset", desc: "new device identity, new session ids, clear stuck errors; pass a folder" },
+    "opencode-unlimited:identity": { args: "identity", desc: "show, rotate or restore the virtual device identity" },
+    "opencode-unlimited:block": { args: "block", desc: "egress blocks seen today and which are spent" },
+    "opencode-unlimited:usage": { args: "usage", desc: "daily free bucket state and the reset clock" },
+    "opencode-unlimited:clear": { args: "clear", desc: "strip stored free-limit errors from sessions" },
+    "opencode-unlimited:reid": { args: "reid", desc: "mint fresh session ids, keep every message" },
+    "opencode-unlimited:model": { args: "model", desc: "list providers and switch this folder to a free model" },
+  };
+  const argNames = ["opencode-unlimited:reset", "opencode-unlimited:clear", "opencode-unlimited:reid", "opencode-unlimited:model"];
+
+  let cfgPath = path.join(configDir, "opencode.jsonc");
+  if (!fs.existsSync(cfgPath)) cfgPath = path.join(configDir, "opencode.json");
+
+  let cfg = {};
+  if (fs.existsSync(cfgPath)) {
+    try {
+      const raw = fs.readFileSync(cfgPath, "utf8").replace(/^\uFEFF/, "");
+      cfg = JSON.parse(raw);
+    } catch {
+      warn(`could not parse ${cfgPath}, slash commands skipped`);
+      return;
+    }
+  }
+
+  if (!cfg.commands || typeof cfg.commands !== "object") {
+    cfg.commands = {};
+  }
+
+  for (const [name, def] of Object.entries(defs)) {
+    let argText = def.args;
+    if (argNames.includes(name)) argText += ' "$ARGUMENTS"';
+    const template = `!\`${cli}\` ${argText}${tail}`;
+    cfg.commands[name] = { description: def.desc, template };
+  }
+
+  ensureDir(path.dirname(cfgPath));
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+  ok("slash commands: " + Object.keys(defs).join(", "));
+}
+
+function removeSlashCommands() {
+  for (const file of ["opencode.jsonc", "opencode.json"]) {
+    const cfgPath = path.join(configDir, file);
+    if (!fs.existsSync(cfgPath)) continue;
+    try {
+      const raw = fs.readFileSync(cfgPath, "utf8").replace(/^\uFEFF/, "");
+      const cfg = JSON.parse(raw);
+      if (cfg && cfg.commands && typeof cfg.commands === "object") {
+        for (const name of Object.keys(cfg.commands)) {
+          if (name.startsWith("opencode-unlimited")) {
+            delete cfg.commands[name];
+          }
+        }
+        fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+        ok(`slash commands removed from ${file}`);
+      }
+    } catch {}
+  }
+}
+
+function getPathArg(args) {
+  for (const item of args) {
+    if (!item) continue;
+    if (item === "-Db" || item === "--db" || item === "-Dry" || item === "--dry" || item === "-KeepIds" || item === "--keep-ids" || item === "-fix" || item === "--fix") continue;
+    if (item.startsWith("-")) continue;
+    return item;
+  }
+  return "";
+}
+
+function removeStuckErrors(targetDir = "") {
+  const dbPath = getDatabasePath();
+  if (!dbPath) {
+    warn("opencode.db not found");
+    return;
+  }
+  try {
+    const db = new DatabaseSync(dbPath);
+    db.exec("pragma busy_timeout = 8000");
+    const res = dbTools.clear(db, targetDir);
+    db.close();
+    info(Array.isArray(res) ? res.join(" ") : String(res));
+  } catch (err) {
+    bad(`clear error: ${err.message}`);
+  }
+}
+
+function showReidBatch(data) {
+  if (!data) {
+    bad("no result");
+    return;
+  }
+  if (data.error) {
+    bad(String(data.error));
+    return;
+  }
+  if (data.dryRun) {
+    const mb = Math.round(((data.results || []).reduce((sum, r) => sum + (r.bytes || 0), 0) / 1048576) * 10) / 10;
+    step(`==> would re-id ${data.selected || 0} of ${data.total || 0} sessions, ${mb} MB`);
+    for (const row of (data.results || []).slice(0, 15)) {
+      info(`${row.oldId}  messages=${row.messages} refs=${row.refs}`);
+    }
+    if ((data.total || 0) > 15) {
+      info(`... and ${data.total - 15} more`);
+    }
+    info("nothing was written, drop -Dry / --dry to run it");
+    return;
+  }
+  for (const row of data.results || []) {
+    ok(`${row.oldId}  ->  ${row.newId}  (${row.messages} messages, ${row.moved} rows moved)`);
+  }
+  for (const row of data.failed || []) {
+    if (row) bad(`${row.oldId}  ${row.error}`);
+  }
+  info(`total   : ${data.total || 0} sessions in that folder`);
+  info(`reid    : ${data.reid || 0}   failed: ${(data.failed || []).length}`);
+  info(`moved   : ${data.rows || 0} rows, ${data.messages || 0} messages kept`);
+  info("no rows were deleted, the old ids are gone from the table");
+}
+
+function invokeReidPath(target, dry = false) {
+  const dbPath = getDatabasePath();
+  if (!dbPath) return null;
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec("pragma busy_timeout = 8000");
+    return sessionReid.reidAll(db, target, { dryRun: dry });
+  } catch (err) {
+    return { error: err.message };
+  } finally {
+    db.close();
+  }
+}
+
+function testLimitOutput(text = "") {
+  return /FreeUsageLimit|Free usage limit|free messages|free tier/i.test(text);
+}
+
+function invokeAppProbe(directory = "") {
+  const exe = ocInfo.findExe();
+  if (!exe) return { ok: false, blocked: false, reason: "opencode binary not found" };
+  const cfg = getConfig();
+  const infoData = getOpenCodeInfo();
+  let model = cfg.model || DEFAULT_MODEL;
+  if (model.includes("/")) model = model.split("/").pop();
+  const freeModels = infoData.freeModels || [];
+  if (freeModels.length > 0 && !freeModels.includes(model) && infoData.freeModel) {
+    model = infoData.freeModel;
+  }
+  const fullModel = `opencode/${model}`;
+
+  let work = directory;
+  let throwaway = false;
+  if (!work) {
+    work = path.join(os.tmpdir(), `unlimited-probe-${Math.random().toString(16).slice(2, 8)}`);
+    ensureDir(work);
+    throwaway = true;
+  }
+
+  try {
+    const out = child_process.execFileSync(exe, ["run", "-m", fullModel, "reply with exactly: ok"], {
+      cwd: work,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 30000,
+    });
+    if (testLimitOutput(out)) {
+      return { ok: false, blocked: true, reason: "app refused on free limit", model: fullModel };
+    }
+    if (/\bok\b/i.test(out)) {
+      return { ok: true, blocked: false, reason: "app answered", model: fullModel };
+    }
+    return { ok: false, blocked: false, reason: "app did not answer", model: fullModel };
+  } catch (err) {
+    const combined = `${err.stdout || ""} ${err.stderr || ""} ${err.message || ""}`;
+    if (testLimitOutput(combined)) {
+      return { ok: false, blocked: true, reason: "app refused on free limit", model: fullModel };
+    }
+    return { ok: false, blocked: false, reason: err.message, model: fullModel };
+  } finally {
+    if (throwaway) {
+      try { fs.rmSync(work, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
+
+// ----------------- Command Handlers -----------------
+
+function cmdHelp() {
+  step("opencode-unlimited <command>");
+  step("");
+  info("reset [path]         new device id, new session ids, clear errors");
+  info("reset [path] --dry   show what the session re-id would touch");
+  info("identity [rotate]    show or rotate the virtual device identity");
+  info("identity restore     drop the virtual identity, system files never touched");
+  info("block                egress blocks seen today, and which are spent");
+  info("block check          is the address you are on now still usable");
+  info("usage                free check of the meter and the reset clock");
+  info("sessions [path]      list sessions and their ids for a folder");
+  info("model                list providers and free models you can switch to");
+  info("model <spec>         switch this folder to provider/model[#variant]");
+  info("model <path> <spec>  switch a session id or a whole folder");
+  info("reid <id|path>       mint fresh session ids, keep every message");
+  info("clear [path]         strip stored free-limit errors");
+  info("verify [--fix]       check sessions decode, no dangling state");
+  info("");
+  info("install              register PATH, install the slash command");
+  info("status               runtime, identity, network, bucket");
+  info("doctor               check node, service, schema, identity");
+  info("version              tool version plus the detected opencode version");
+  info("on | off             enable or disable the identity plugin");
+  info("proxy set <url>      route opencode through socks5:// or http://");
+  info("proxy off            drop the upstream, direct egress");
+  info("proxy status         show the current upstream and the pool");
+  info("proxy pool add <url> queue proxies for reset to cycle through");
+  info("proxy pool clear     empty the pool, upstream left as is");
+  info("proxy next           jump to the next pooled proxy now");
+  info("warp on|off|rotate   Cloudflare WARP path (optional)");
+  info("run <args...>        run opencode, rotate on free-limit");
+  info("uninstall            remove plugin, slash commands, state");
+}
+
+function cmdVersion() {
+  const inf = getOpenCodeInfo();
+  step(`opencode-unlimited ${TOOL_VERSION}`);
+  info(`opencode   : ${inf.version ? "v" + inf.version : "not detected"}`);
+  info(`api        : ${inf.api ? "v" + inf.api : "unknown"}`);
+  info(`session t. : ${inf.schema?.sessionTable || "unknown"}`);
+  info(`gateway    : ${inf.gateway}`);
+}
+
+function cmdInstall(args = []) {
+  step("==> installing opencode-unlimited");
+  installSlashCommands();
+
+  const cfg = getConfig();
+  const inf = getOpenCodeInfo();
+  if (inf.orgId) {
+    cfg.orgId = inf.orgId;
+    ok(`org id discovered: ${inf.orgId}`);
+  } else {
+    warn("org id not discovered yet, run opencode once and retry");
+  }
+  saveConfig(cfg);
+
+  const binDir = scriptDir;
+  const currentPath = process.env.PATH || "";
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  if (!currentPath.split(delimiter).includes(binDir)) {
+    info(`add to PATH: export PATH="${binDir}:$PATH"`);
+  } else {
+    info(`already on PATH: ${binDir}`);
+  }
+
+  if (fs.existsSync(pluginFile)) {
+    warn("an old header plugin is still present");
+    info("remove it with: opencode-unlimited off");
+  } else {
+    ok("header plugin not installed (it does not change the quota)");
+  }
+  step("");
+  ok("done. try: opencode-unlimited usage");
+}
+
+function cmdUninstall() {
+  step("==> uninstalling opencode-unlimited");
+  stopBridge();
+  setPluginEnabled(false);
+  try { if (fs.existsSync(pluginFile)) fs.unlinkSync(pluginFile); } catch {}
+  try { if (fs.existsSync(pluginFile + ".disabled")) fs.unlinkSync(pluginFile + ".disabled"); } catch {}
+  ok("plugin removed");
+
+  removeSlashCommands();
+  setServiceEnv("HTTPS_PROXY", "");
+  setServiceEnv("HTTP_PROXY", "");
+  setServiceEnv("ALL_PROXY", "");
+  ok("service proxy cleared");
+
+  for (const f of [stateFile, infoFile, pidFile, logFile]) {
+    try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
+  }
+  ok("state files removed");
+  info(`repo directory kept: ${rootDir}`);
+}
+
+function cmdOn() {
+  installPlugin();
+  setPluginEnabled(true);
+  ok("identity plugin enabled");
+}
+
+function cmdOff() {
+  setPluginEnabled(false);
+  ok("identity plugin disabled");
+}
+
+function cmdIdentity(args = []) {
+  const action = args.includes("rotate") || args.includes("--rotate")
+    ? "rotate"
+    : args.includes("restore") || args.includes("--restore")
+    ? "restore"
+    : "show";
+
+  if (action === "rotate") {
+    const data = identity.rotate();
+    step("==> device identity");
+    info(`device id  : ${data.deviceId}`);
+    info(`fingerprint: ${data.fingerprint}`);
+    info(`generation : ${data.generation}`);
+    info(`state      : ${data.stateFile}`);
+    info(`value file : ${data.shimFile}`);
+    info("system files: not touched");
+    ok("new device identity minted");
+    return;
+  }
+
+  if (action === "restore") {
+    const data = identity.restore();
+    ok("virtual device identity removed");
+    info(`state   : ${data.stateFile}`);
+    info("system machine guid was never touched, nothing to undo");
+    return;
+  }
+
+  const data = identity.show();
+  step("==> device identity");
+  if (!data.exists) {
+    warn("no virtual identity minted yet");
+    info("opencode-unlimited identity rotate");
+    return;
+  }
+  info(`device id  : ${data.deviceId}`);
+  info(`fingerprint: ${data.fingerprint}`);
+  info(`generation : ${data.generation}`);
+  info(`state      : ${data.stateFile}`);
+  info(`value file : ${data.shimFile}`);
+  info("system files: not touched");
+}
+
+async function cmdBlock(args = []) {
+  if (args.includes("clear") || args.includes("--clear")) {
+    egress.save({ day: egress.utcDay(), addresses: {} });
+    ok("egress ledger cleared for today");
+    return;
+  }
+
+  if (args.includes("check") || args.includes("--check")) {
+    const cfg = getConfig();
+    const ip = await getEgressIp(cfg.proxy, true);
+    if (!ip || ip === "unavailable") {
+      bad("could not read the egress ip");
+      return;
+    }
+    const data = egress.check({ ip });
+    step(`==> ${ip}  block ${data ? data.block : "?"}`);
+    if (data && data.spent) {
+      warn("SPENT - refused today, dead until 00:00 UTC");
+      info("change the address, or switch model");
+    } else {
+      ok("no refusal recorded today on this block");
+    }
+    return;
+  }
+
+  const data = egress.show();
+  step(`==> egress blocks seen today (${data.total}, spent ${data.spent})`);
+  info("the meter keys on the block, an ipv4 address or an ipv6 /64");
+  for (const row of data.blocks || []) {
+    const state = row.spent ? "SPENT" : "open ";
+    info(`${row.block.padEnd(24)} ${state}  open=${row.open} refused=${row.refused}  last=${row.lastStatus}`);
+  }
+  const minutes = Math.floor(data.secondsToReset / 60);
+  step("");
+  info(`reset at 00:00 UTC, in ${minutes} minutes`);
+}
+
+async function cmdUsage(args = []) {
+  const cfg = getConfig();
+  const deep = args.includes("-check") || args.includes("--check") || args.includes("-live") || args.includes("--live");
+  step("==> free tier check");
+  const ip = await getEgressIp(cfg.proxy, true);
+  info(`egress ip : ${ip || "unknown"}`);
+  cfg.lastIp = ip;
+  saveConfig(cfg);
+
+  const ledger = egress.show();
+  let row = null;
+  if (ledger && ip && ip !== "unavailable") {
+    const want = ip.includes(":") ? ip.split(":").slice(0, 4).join(":") : ip;
+    for (const item of ledger.blocks || []) {
+      if (item.block.startsWith(want)) {
+        row = item;
+        break;
+      }
+    }
+  }
+
+  if (row) {
+    info(`block     : ${row.block}`);
+    if (row.spent) {
+      warn(`SPENT - a refusal was recorded today (HTTP ${row.lastStatus})`);
+      info("the meter is per egress block, every session on this address shares it");
+      info("change the address, or switch model, or wait for the reset");
+    } else {
+      ok("no refusal recorded today on this block");
+      if (row.open > 0) info(`${row.open} answered requests seen today`);
+    }
+  } else {
+    info(`block     : ${ip || "unknown"}`);
+    warn("nothing recorded today on this block");
+    info("a refusal gets logged here the next time the app reports one");
+  }
+
+  if (deep) {
+    step("");
+    step("app check");
+    info("this opens a throwaway session and spends one real message");
+    const app = invokeAppProbe();
+    if (app.ok) {
+      egress.record({ ip, status: 200, retryAfter: 0 });
+      ok("OPEN - the app answered on this connection");
+    } else if (app.blocked) {
+      egress.record({ ip, status: 429, retryAfter: 0 });
+      bad("BLOCKED - the app itself was refused on this connection");
+    } else {
+      warn(`unconfirmed - ${app.reason}`);
+    }
+  }
+
+  const midnight = egress.nextMidnightUtc();
+  const wait = Math.max(0, Math.floor((midnight - Date.now()) / 60000));
+  step("");
+  info(`reset : ${new Date(midnight).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} local   in ${wait} minutes`);
+  info("skip the meter entirely: opencode-unlimited model");
+}
+
+function cmdClear(args = []) {
+  step("==> clearing stored limit errors");
+  const target = getPathArg(args);
+  if (target) {
+    info(`scope: ${target}`);
+    removeStuckErrors(target);
+  } else {
+    info("scope: every session");
+    removeStuckErrors();
+  }
+  info("the banner comes from stored error rows, not from the server");
+  info("if a new prompt still fails, your egress ip is still on the spent bucket");
+}
+
+function cmdVerify(args = []) {
+  step("==> checking session integrity");
+  const fix = args.includes("-fix") || args.includes("--fix");
+  const dbPath = getDatabasePath();
+  if (!dbPath) {
+    bad("opencode.db not found");
+    return;
+  }
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec("pragma busy_timeout = 8000");
+    const lines = dbTools.verify(db, fix);
+    let found = false;
+    for (const line of lines) {
+      const text = String(line || "").trim();
+      if (!text) continue;
+      if (text.startsWith("no problems") || text.includes("fixed ")) {
+        ok(text);
+      } else if (/^(opencode\.db|node 22|node not|missing helper|schema)/i.test(text)) {
+        bad(text);
+        found = true;
+      } else {
+        warn(text);
+        found = true;
+      }
+    }
+    if (!fix && found) {
+      info("run with --fix to repair the listed items");
+    }
+  } catch (err) {
+    bad(`verify error: ${err.message}`);
+  } finally {
+    db.close();
+  }
+}
+
+function cmdSessions(args = []) {
+  const dbPath = getDatabasePath();
+  if (!dbPath) {
+    bad("opencode.db not found");
+    return;
+  }
+  const target = getPathArg(args);
+  const rows = ocInfo.listSessions(dbPath, target);
+  if (!rows || rows.length === 0) {
+    warn("no sessions found");
+    return;
+  }
+  const inf = getOpenCodeInfo();
+  step(`==> sessions (${rows.length})${inf.schema?.sessionTable ? ", table " + inf.schema.sessionTable : ""}`);
+  info("size is the replayed history, the thing a free turn has to pay for");
+  for (const row of rows) {
+    let title = row.title || "(untitled)";
+    if (title.length > 40) title = title.substring(0, 40);
+    const when = row.updated ? new Date(row.updated).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    const mb = Math.round(((Number(row.bytes) || 0) / 1048576) * 10) / 10;
+    const size = `${mb.toFixed(1).padStart(7)} MB`;
+    info(`${row.id}  ${when.padEnd(12)}  ${size}  ${title}`);
+  }
+}
+
+function cmdReid(args = []) {
+  const dry = args.includes("-Dry") || args.includes("--dry");
+  const target = getPathArg(args);
+  if (!target) {
+    step("==> mint a fresh session id");
+    bad("name a session id or a folder");
+    info("opencode-unlimited reid ses_abc123...");
+    info('opencode-unlimited reid "~/path/to/project" --dry');
+    return;
+  }
+
+  const dbPath = getDatabasePath();
+  if (!dbPath) {
+    bad("opencode.db not found");
+    return;
+  }
+
+  if (target.startsWith("ses_")) {
+    step("==> minting a fresh session id");
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec("pragma busy_timeout = 8000");
+      const result = sessionReid.reid(db, target, {});
+      ok(`old id : ${result.oldId}`);
+      ok(`new id : ${result.newId}`);
+      info(`table  : ${result.sessionTable}`);
+      info(`messages: ${result.messages}   rows moved: ${result.moved}`);
+      for (const item of result.touched || []) {
+        if (item) info(`moved  : ${item}`);
+      }
+      info("open the new id in the app, the messages are all there");
+      info("reid does not refill the quota, it only breaks a fork chain");
+    } catch (err) {
+      bad(`reid failed: ${err.message}`);
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  step(`==> re-id every session in ${target}`);
+  showReidBatch(invokeReidPath(target, dry));
+  info("reid does not refill the quota, it only breaks a fork chain");
+}
+
+function cmdModel(args = []) {
+  const dbPath = getDatabasePath();
+  if (!dbPath) {
+    bad("opencode.db not found");
+    return;
+  }
+  const cleanArgs = args.filter((a) => a && !a.startsWith("-"));
+  const db = new DatabaseSync(dbPath);
+  try {
+    if (cleanArgs.length === 0) {
+      const data = modelSwitch.listModels(db);
+      if (!data || !data.providers) {
+        bad("could not read the model registry");
+        info("run opencode once so the cache fills, then try again");
+        return;
+      }
+      step(`==> providers with credentials (${(data.providers || []).length})`);
+      info(`registry: ${data.registry}`);
+      info("free means the provider bills nothing for that model");
+      for (const provider of data.providers || []) {
+        const models = provider.models || [];
+        const free = models.filter((m) => m.free);
+        step("");
+        step(`  ${provider.providerID}  models=${models.length}  free=${free.length}`);
+        for (const m of free.slice(0, 12)) {
+          const ctx = m.context ? `  ctx ${Math.round(m.context / 1000)}k` : "";
+          info(`    ${provider.providerID}/${m.id}${ctx}`);
+        }
+        if (free.length === 0) {
+          for (const m of models.slice(0, 4)) {
+            info(`    ${provider.providerID}/${m.id}`);
+          }
+        }
+      }
+      step("");
+      info("switch a session: opencode-unlimited model <session-id|folder> provider/model");
+      return;
+    }
+
+    let target = "";
+    let spec = "";
+    if (cleanArgs.length === 1) {
+      if (cleanArgs[0].includes("/") && !fs.existsSync(cleanArgs[0])) {
+        spec = cleanArgs[0];
+        target = process.cwd();
+      } else {
+        target = cleanArgs[0];
+      }
+    } else {
+      target = cleanArgs[0];
+      spec = cleanArgs[1];
+    }
+
+    if (!spec) {
+      const schema = ocInfo.detectSchema(db, { deep: false });
+      const resolved = modelSwitch.resolveTarget(db, schema, target);
+      step(`==> current model (${resolved.ids.length} sessions)`);
+      for (const id of resolved.ids) {
+        info(`${id}`);
+      }
+      return;
+    }
+
+    const res = modelSwitch.setModel(db, { target, spec, force: false });
+    step("==> model switched");
+    info(`target : ${res.kind} ${res.directory || ""}`);
+    info(`model  : ${res.spec}`);
+    for (const row of res.changed || []) {
+      ok(`${row.id}`);
+    }
+    info(`sessions changed: ${(res.changed || []).length}`);
+    step("");
+    if (res.applied?.providerID === "opencode") {
+      warn("opencode models are metered per egress address, this keeps the daily wall");
+    } else {
+      ok("this pipe is not metered by the opencode free wall");
+    }
+    info("restart the app so the session picks up the new model");
+  } catch (err) {
+    bad(`model command failed: ${err.message}`);
+  } finally {
+    db.close();
+  }
+}
+
+async function cmdReset(args = []) {
+  const dry = args.includes("-Dry") || args.includes("--dry");
+  const keepIds = args.includes("-KeepIds") || args.includes("--keep-ids");
+  step(dry ? "==> reset (dry run, nothing is written)" : "==> reset");
+
+  const cfg = getConfig();
+  const target = getPathArg(args);
+  const ipBefore = await getEgressIp(cfg.proxy, true);
+  info(`egress ip before: ${ipBefore || "unknown"}`);
+
+  step("");
+  step("[1/6] device identity");
+  if (dry) {
+    const curr = identity.show();
+    info(`current id: ${curr.deviceId || "none"}`);
+  } else {
+    const rotated = identity.rotate();
+    ok(`device id : ${rotated.deviceId}`);
+    info(`generation: ${rotated.generation}   fingerprint: ${rotated.fingerprint}`);
+  }
+  info("local only, system identifiers untouched");
+
+  step("");
+  step("[2/6] stored limit errors");
+  if (dry) {
+    info("skipped in a dry run");
+  } else {
+    removeStuckErrors(target);
+  }
+
+  step("");
+  step("[3/6] session ids");
+  if (keepIds) {
+    info("skipped, --keep-ids was passed");
+  } else if (!target) {
+    info("skipped, pass a folder to re-id its sessions");
+    info('opencode-unlimited reset "/path/to/project"');
+  } else {
+    showReidBatch(invokeReidPath(target, dry));
+  }
+
+  step("");
+  step("[4/6] egress route");
+  await invokeEgressRotation(cfg, ipBefore, dry);
+
+  step("");
+  step("[5/6] egress block");
+  await new Promise((r) => setTimeout(r, 1000));
+  const ipAfter = await getEgressIp(cfg.proxy, true);
+  if (dry) {
+    info(`ip now: ${ipAfter || "unknown"}, nothing recorded`);
+  } else {
+    cfg.lastIp = ipAfter;
+    saveConfig(cfg);
+    if (ipAfter && ipAfter !== "unavailable") {
+      egress.record({ ip: ipAfter, status: 0, retryAfter: 0 });
+    }
+    if (!ipAfter || ipAfter === "unavailable") {
+      warn("egress ip unknown");
+    } else if (ipAfter === ipBefore) {
+      warn(`ip unchanged: ${ipAfter}`);
+      info("the meter follows the egress block, not the project, the session or the device");
+      info("if a refusal was logged today, this block stays spent until 00:00 UTC");
+      info("change the connection, or switch model to leave the meter behind");
+    } else {
+      ok(`new egress ip: ${ipAfter}`);
+    }
+  }
+
+  step("");
+  step("[6/6] database");
+  if (dry) {
+    info("skipped in a dry run");
+  } else {
+    cmdVerify(["--fix"]);
+    info("sessions and messages untouched");
+  }
+
+  step("");
+  const midnight = egress.nextMidnightUtc();
+  if (dry) ok("dry run complete, nothing was written");
+  else ok("reset complete");
+  info(`quota resets at ${new Date(midnight).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} local, 00:00 UTC`);
+  info("switch model to skip the meter: opencode-unlimited model provider/model");
+}
+
+function showProxyPool(cfg) {
+  const pool = Array.isArray(cfg.proxyPool) ? cfg.proxyPool : [];
+  if (!pool.length) {
+    info("pool: empty");
+    info("opencode-unlimited proxy pool add socks5://host:port");
+    return;
+  }
+  const active = Number(cfg.proxyIndex || 0);
+  info(`pool: ${pool.length} entries, active #${active + 1}`);
+  for (let i = 0; i < pool.length; i++) {
+    const mark = i === active ? "->" : "  ";
+    info(`  ${mark} ${i + 1}. ${pool[i]}`);
+  }
+}
+
+async function cmdProxy(args = []) {
+  const cfg = getConfig();
+  const sub = args[0] || "status";
+
+  switch (sub) {
+    case "off": {
+      stopBridge();
+      cfg.proxy = "";
+      cfg.ipMode = "manual";
+      saveConfig(cfg);
+      applyProxy(cfg);
+      restartService();
+      info("egress is direct again");
+      break;
+    }
+    case "next": {
+      await invokeEgressRotation(cfg, "");
+      saveConfig(cfg);
+      break;
+    }
+    case "pool": {
+      const action = args[1] || "show";
+      switch (action) {
+        case "add": {
+          const urls = args.slice(2);
+          if (!urls.length) {
+            bad("expected one or more proxy urls");
+            return;
+          }
+          const pool = Array.isArray(cfg.proxyPool) ? [...cfg.proxyPool] : [];
+          let added = 0;
+          for (const u of urls) {
+            if (!/^(socks5h?|https?):\/\//i.test(u)) {
+              bad(`skipped, not a proxy url: ${u}`);
+              continue;
+            }
+            if (pool.includes(u)) {
+              info(`already in pool: ${u}`);
+              continue;
+            }
+            pool.push(u);
+            added++;
+          }
+          cfg.proxyPool = pool;
+          saveConfig(cfg);
+          ok(`pool size: ${pool.length} (+${added})`);
+          showProxyPool(cfg);
+          break;
+        }
+        case "set": {
+          const urls = args.slice(2).filter((u) => /^(socks5h?|https?):\/\//i.test(u));
+          if (!urls.length) {
+            bad("expected one or more proxy urls");
+            return;
+          }
+          cfg.proxyPool = urls;
+          cfg.proxyIndex = 0;
+          saveConfig(cfg);
+          ok(`pool replaced, ${urls.length} entries`);
+          showProxyPool(cfg);
+          break;
+        }
+        case "clear": {
+          cfg.proxyPool = [];
+          cfg.proxyIndex = 0;
+          saveConfig(cfg);
+          ok("pool cleared, the current upstream was left alone");
+          break;
+        }
+        default: {
+          showProxyPool(cfg);
+          break;
+        }
+      }
+      break;
+    }
+    case "status": {
+      info(`upstream : ${cfg.proxy || "none (manual)"}`);
+      info(`bridge   : 127.0.0.1:${cfg.bridgePort}`);
+      info(`ip       : ${await getEgressIp(cfg.proxy)}`);
+      showProxyPool(cfg);
+      break;
+    }
+    default: {
+      const url = sub === "set" && args[1] ? args[1] : sub;
+      if (!/^(socks5h?|https?):\/\//i.test(url)) {
+        bad("expected socks5://host:port or http://host:port");
+        return;
+      }
+      cfg.proxy = url;
+      cfg.ipMode = "proxy";
+      if (!applyProxy(cfg)) {
+        cfg.proxy = "";
+        cfg.ipMode = "manual";
+        saveConfig(cfg);
+        info("state left on manual, nothing was restarted");
+        return;
+      }
+      saveConfig(cfg);
+      restartService();
+      await new Promise((r) => setTimeout(r, 1000));
+      info(`egress ip via proxy: ${await getEgressIp(cfg.proxy)}`);
+      break;
+    }
+  }
+}
+
+function getWarpCli() {
+  try {
+    const exe = "warp-cli";
+    child_process.execFileSync(exe, ["--version"], { stdio: "ignore" });
+    return exe;
+  } catch {
+    return "";
+  }
+}
+
+async function cmdWarp(args = []) {
+  const warp = getWarpCli();
+  if (!warp) {
+    bad("warp-cli not found, install Cloudflare WARP or use: proxy set socks5://host:port");
+    return;
+  }
+  const cfg = getConfig();
+  const sub = args[0] || "status";
+  switch (sub) {
+    case "on": {
+      try { child_process.execFileSync(warp, ["mode", "proxy"], { stdio: "ignore" }); } catch {}
+      try { child_process.execFileSync(warp, ["proxy", "port", "40000"], { stdio: "ignore" }); } catch {}
+      try { child_process.execFileSync(warp, ["connect"], { stdio: "ignore" }); } catch {}
+      cfg.proxy = "socks5://127.0.0.1:40000";
+      cfg.ipMode = "warp";
+      saveConfig(cfg);
+      applyProxy(cfg);
+      restartService();
+      ok("warp proxy mode on, opencode routed through the bridge");
+      break;
+    }
+    case "off": {
+      try { child_process.execFileSync(warp, ["disconnect"], { stdio: "ignore" }); } catch {}
+      stopBridge();
+      cfg.proxy = "";
+      cfg.ipMode = "manual";
+      saveConfig(cfg);
+      applyProxy(cfg);
+      restartService();
+      ok("warp off, direct egress");
+      break;
+    }
+    case "rotate": {
+      info("reconnecting warp, this can change the egress ip");
+      const before = await getEgressIp(cfg.proxy);
+      try { child_process.execFileSync(warp, ["disconnect"], { stdio: "ignore" }); } catch {}
+      await new Promise((r) => setTimeout(r, 2000));
+      try { child_process.execFileSync(warp, ["connect"], { stdio: "ignore" }); } catch {}
+      await new Promise((r) => setTimeout(r, 4000));
+      const after = await getEgressIp(cfg.proxy);
+      if (after === before) {
+        warn(`ip unchanged: ${after}`);
+        info("warp does not guarantee a new ip, reconnect again or use a proxy");
+      } else {
+        ok(`new egress ip: ${before} -> ${after}`);
+      }
+      break;
+    }
+    default: {
+      try {
+        const out = child_process.execFileSync(warp, ["status"], { encoding: "utf8" });
+        for (const line of out.split("\n")) {
+          if (line.trim()) info(line.trim());
+        }
+      } catch (err) {
+        bad(`warp status failed: ${err.message}`);
+      }
+      break;
+    }
+  }
+}
+
+async function cmdRun(args = []) {
+  if (!args.length) {
+    bad("usage: opencode-unlimited run <opencode args>");
+    return 1;
+  }
+  const exe = ocInfo.findExe();
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const out = child_process.execFileSync(exe, args, { encoding: "utf8" });
+      process.stdout.write(out);
+      return 0;
+    } catch (err) {
+      const combined = `${err.stdout || ""} ${err.stderr || ""} ${err.message || ""}`;
+      if (testLimitOutput(combined)) {
+        warn(`free limit hit (attempt ${attempt}/3)`);
+        const ip = await getEgressIp("", true);
+        if (ip) egress.record({ ip, status: 429, retryAfter: 0 });
+        identity.rotate();
+        const cfg = getConfig();
+        if (cfg.proxy) {
+          applyProxy(cfg);
+          restartService();
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+      if (err.stdout) process.stdout.write(err.stdout);
+      if (err.stderr) process.stderr.write(err.stderr);
+      return err.status || 1;
+    }
+  }
+  bad("still limited after 3 attempts");
+  info("the meter follows the egress block, change the connection and run: opencode-unlimited usage");
+  return 1;
+}
+
+async function cmdStatus() {
+  const cfg = getConfig();
+  const inf = getOpenCodeInfo();
+  step("==> opencode-unlimited status");
+  step("");
+  step("runtime");
+  const versionText = inf.version ? `v${inf.version}${inf.api ? " (api v" + inf.api + ")" : ""}` : "not detected";
+  info(`opencode   : ${versionText}`);
+  info(`binary     : ${inf.exe}`);
+  info(`service    : ${inf.service?.running ? "running" : "not running (start the app once)"}`);
+  info(`gateway    : ${inf.gateway}`);
+  info(`database   : ${inf.dbPath || "not found"}`);
+  info(`session t. : ${inf.schema?.sessionTable || "unknown"}`);
+  if ((inf.freeModels || []).length > 0) {
+    info(`free models: ${inf.freeModels.length} listed, default ${inf.freeModel}`);
+  }
+
+  step("");
+  step("identity");
+  const vid = identity.show();
+  if (vid && vid.exists) {
+    info(`device id  : ${vid.deviceId}`);
+    info(`fingerprint: ${vid.fingerprint}   generation ${vid.generation}`);
+    info("system files: not touched, this id lives in a local file");
+  } else {
+    warn("no virtual identity yet, run: opencode-unlimited identity rotate");
+  }
+
+  step("");
+  step("plugin");
+  info(`state      : ${getPluginState()}`);
+  info(`path       : ${pluginFile}`);
+
+  step("");
+  step("network");
+  info(`egress ip  : ${await getEgressIp(cfg.proxy)}`);
+  info(`ipMode     : ${cfg.ipMode}`);
+  info(`upstream   : ${cfg.proxy || "none (manual)"}`);
+  const pid = getBridgePid();
+  if (pid > 0) {
+    info(`bridge     : running (pid ${pid}, port ${cfg.bridgePort})`);
+  } else {
+    info("bridge     : stopped");
+  }
+  const warp = getWarpCli();
+  info(`warp-cli   : ${warp || "not installed (optional)"}`);
+
+  step("");
+  step("egress ledger");
+  const ledger = egress.show();
+  if (ledger) {
+    info(`today       : ${ledger.day}   blocks seen ${ledger.total}   spent ${ledger.spent}`);
+    const minutes = Math.floor(ledger.secondsToReset / 60);
+    info(`next reset  : 00:00 UTC, in ${minutes} minutes`);
+  } else {
+    warn("ledger unreadable");
+  }
+  info("details     : opencode-unlimited usage");
+}
+
+async function cmdDoctor() {
+  step("==> opencode-unlimited doctor");
+  step("");
+  info(`os         : ${process.platform} ${os.release()} (${os.arch()})`);
+  info(`node       : ${process.version}`);
+  try {
+    new DatabaseSync(":memory:").close();
+    ok("sqlite     : node:sqlite available");
+  } catch {
+    bad("sqlite     : needs node 22.5+ for -Db features");
+  }
+
+  if (getCurl()) ok("curl       : found");
+  else warn("curl       : missing, using native fetch fallback");
+
+  info(`tool       : ${__filename}`);
+  const inf = getOpenCodeInfo(true);
+  info(`opencode   : ${inf.exe}`);
+  if (inf.version) ok(`version    : v${inf.version}${inf.api ? " (api v" + inf.api + ")" : ""}`);
+  else warn("version    : not detected, is opencode on PATH?");
+
+  if (inf.service?.running) ok("service    : running");
+  else warn("service    : not reachable, start opencode once");
+
+  info(`gateway    : ${inf.gateway}`);
+  info(`database   : ${inf.dbPath || "not found"}`);
+  info(`session t. : ${inf.schema?.sessionTable || "unknown"}`);
+
+  const vid = identity.show();
+  if (vid && vid.exists) ok(`identity   : ${vid.deviceId}`);
+  else warn("identity   : missing, run: opencode-unlimited identity rotate");
+
+  const cfg = getConfig();
+  info(`upstream   : ${cfg.proxy || "none (manual)"}`);
+  info(`egress ip  : ${await getEgressIp(cfg.proxy)}`);
+}
+
+// ----------------- Entry Point -----------------
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const command = (argv[0] || "help").toLowerCase();
+  const rest = argv.slice(1);
+
+  switch (command) {
+    case "install":
+      cmdInstall(rest);
+      break;
+    case "uninstall":
+      cmdUninstall();
+      break;
+    case "on":
+      cmdOn();
+      break;
+    case "off":
+      cmdOff();
+      break;
+    case "reset":
+      await cmdReset(rest);
+      break;
+    case "clear":
+      cmdClear(rest);
+      break;
+    case "verify":
+      cmdVerify(rest);
+      break;
+    case "sessions":
+      cmdSessions(rest);
+      break;
+    case "reid":
+      cmdReid(rest);
+      break;
+    case "model":
+      cmdModel(rest);
+      break;
+    case "identity":
+      cmdIdentity(rest);
+      break;
+    case "block":
+      await cmdBlock(rest);
+      break;
+    case "usage":
+      await cmdUsage(rest);
+      break;
+    case "status":
+      await cmdStatus();
+      break;
+    case "proxy":
+      await cmdProxy(rest);
+      break;
+    case "warp":
+      await cmdWarp(rest);
+      break;
+    case "run":
+      process.exitCode = await cmdRun(rest);
+      break;
+    case "doctor":
+      await cmdDoctor();
+      break;
+    case "version":
+    case "-v":
+    case "--version":
+      cmdVersion();
+      break;
+    case "help":
+    case "-h":
+    case "--help":
+    default:
+      cmdHelp();
+      break;
+  }
+}
+
+main().catch((err) => {
+  bad(err.message);
+  process.exit(1);
+});
